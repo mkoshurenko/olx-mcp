@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+auth.json
+*.sqlite3
+.DS_Store

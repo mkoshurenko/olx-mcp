@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Read-only olx-mcp probe: auth status + market benchmark. Sends no messages, writes no lots.
 
-Usage: olx_probe.py "RTX 3090" [--city Київ] [--min-valid 15000] [--max-price 45000]
-                    [--exclude "пк,комплект,ноутбук,майнінг"] [--category 123]
-                    [--condition used|new] [--sample 40] [--all]
+Usage: olx_probe.py "RTX 3090" [--city Київ] [--district Дарницький] [--near "метро Осокорки, Київ"] [--radius 1.0]
+                    [--min-valid 15000] [--max-price 45000] [--exclude "пк,комплект,ноутбук,майнінг"]
+                    [--category 123] [--condition used|new] [--sample 40] [--all]
 """
 import argparse
 import json
@@ -18,6 +18,9 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("query")
     p.add_argument("--city")
+    p.add_argument("--district", help="optional district/neighborhood filter")
+    p.add_argument("--near", help="address, metro station, or ЖК to compute distance from")
+    p.add_argument("--radius", type=float, help="max radius in km from --near")
     p.add_argument("--min-valid", type=float)
     p.add_argument("--max-price", type=float)
     p.add_argument("--exclude", help="comma-separated keywords to drop")
@@ -34,6 +37,12 @@ def main() -> int:
     args = {"query": a.query, "sample_size": a.sample}
     if a.city:
         args["city"] = a.city
+    if a.district:
+        args["district"] = a.district
+    if a.near:
+        args["near_address"] = a.near
+    if a.radius is not None:
+        args["radius_km"] = a.radius
     if a.min_valid:
         args["min_valid_price"] = a.min_valid
     if a.max_price:
@@ -46,8 +55,8 @@ def main() -> int:
         args["condition"] = a.condition
     r = s.benchmark_market_price(args)
 
-    for key in ("stats", "haggling"):
-        if key in r:
+    for key in ("target_location", "stats", "haggling"):
+        if key in r and r[key] is not None:
             print(f"{key}:", json.dumps(r[key], ensure_ascii=False))
     lists = [k for k, v in r.items() if isinstance(v, list) and v and isinstance(v[0], dict)]
     for k in lists:
@@ -55,7 +64,8 @@ def main() -> int:
         print(f"{k} ({len(rows)} of {len(r[k])}):")
         for o in rows:
             if a.all:
-                print(f"  {o.get('price')} | {str(o.get('title'))[:70]} | {o.get('city')} | {o.get('age_days')}d | {o.get('reason', '')} | {o.get('url', '')}")
+                dist_str = f" | {o['distance_km']}km (~{o.get('walking_minutes_est')}m)" if o.get("distance_km") is not None else ""
+                print(f"  {o.get('price')} | {str(o.get('title'))[:70]} | {o.get('city')}{dist_str} | {o.get('age_days')}d | {o.get('reason', '')} | {o.get('url', '')}")
             else:
                 print(" ", json.dumps(o, ensure_ascii=False)[:500])
     if not lists and "stats" not in r:

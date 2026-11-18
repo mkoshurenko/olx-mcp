@@ -1,11 +1,11 @@
 ---
 name: olx-buyer
-description: Searches, benchmarks market prices, maintains per-lot handoff dossiers, and negotiates deals on olx.ua via the olx-mcp server. Use when buying an item or assembling a multi-part PC/hardware build on OLX, benchmarking Ukrainian market prices, haggling with sellers, polling seller chat replies, or resuming OLX lot handoffs across sessions.
+description: Searches, benchmarks market prices, filters by GPS radius/metro/district, maintains per-lot handoff dossiers, and negotiates deals on olx.ua via the olx-mcp server. Use when buying an item, searching for apartments near a metro station or address, assembling a multi-part PC/hardware build on OLX, benchmarking Ukrainian market prices, haggling with sellers, polling seller chat replies, or resuming OLX lot handoffs across sessions.
 ---
 
 # OLX Buyer & Deal Negotiator (`olx-mcp`)
 
-Drive single-item purchases and multi-component hardware builds on `olx.ua` with statistical price benchmarking, human-approved haggling, and persistent per-lot handoff dossiers.
+Drive single-item purchases, real-estate radius searches, and multi-component hardware builds on `olx.ua` with statistical price benchmarking, human-approved haggling, and persistent per-lot handoff dossiers.
 
 ## State & File Locations
 
@@ -14,10 +14,10 @@ Drive single-item purchases and multi-component hardware builds on `olx.ua` with
 | `~/.config/olx-mcp/lots/INDEX.md` | Master table of all tracked lots, current stage, prices, and links to per-lot dossiers |
 | `~/.config/olx-mcp/lots/lot-<OFFER_ID>.md` | Per-lot handoff dossier: build slot, shortlist rationale, target/walk-away prices, seller questions, chat log, price history |
 | `~/.config/olx-mcp/olx_buyer.sqlite3` | SQLite CRM (`campaigns`, `deals`, `price_history`, `negotiation_log`, `lot_handoffs`) |
-| `~/.config/olx-mcp/auth.json` | Mode `0600` vault storing Cognito `access_token`, session cookies (`SID`, `IDPState`, `auth0...`), and optional `google_maps_api_key` |
-| `~/.config/olx-mcp/geocache.json` | Persistent geocode cache for Google Maps Geocoding API & OpenStreetMap Nominatim |
+| `~/.config/olx-mcp/auth.json` | Mode `0600` vault storing Cognito `access_token` + session cookies (`SID`, `IDPState`, `auth0...`) |
+| `~/.config/olx-mcp/geocache.json` | Persistent geocode cache for OpenStreetMap Nominatim (and optional Google Maps Geocoding API) |
 | `src/olx_mcp/server.py` (this repo) | MCP server implementation (23 tools) |
-| `src/olx_mcp/geo.py` (this repo) | Street/ЖК/metro extractor, Google Maps + Nominatim geocoder, and Haversine radius filter |
+| `src/olx_mcp/geo.py` (this repo) | Street/ЖК/metro extractor, OpenStreetMap Nominatim geocoder (zero API key required), and Haversine radius filter |
 
 ## Resuming Context in a New Session
 
@@ -29,7 +29,10 @@ Drive single-item purchases and multi-component hardware builds on `olx.ua` with
 
 ### Step 1: Decompose & Benchmark (`create_buy_campaign` + `benchmark_market_price`)
 - Single item → create one campaign with `create_buy_campaign(query=..., city=..., target_buy_price=...)`.
-- Real estate / local radius search (e.g., apartment within 1 km of a metro station or in a specific district) → pass `near_address="метро Осокорки, Київ"`, `radius_km=1.0`, and/or `district="Дарницький"` to `search_offers` or `benchmark_market_price`. `geo.py` extracts street/ЖК names from the listing title/description, geocodes them via Google Maps API (or OpenStreetMap fallback), and computes exact `distance_km` and `walking_minutes_est`.
+- Real estate / local radius search (e.g., apartment within 1 km of a metro station or in a specific district):
+  - Pass `near_address="метро Осокорки, Київ"`, `radius_km=1.0`, and/or `district="Дарницький"` to `search_offers` or `benchmark_market_price` (use `category_id=1` for Real Estate).
+  - `geo.py` works out-of-the-box via free OpenStreetMap Nominatim (no API key or billing card needed; cached in `~/.config/olx-mcp/geocache.json`), extracts street/ЖК names (`вул. Єлизавети Чавдар 11`, `ЖК Патріотика`, `вул. С.Русової 5-б`) from the listing title/description, geocodes them when OLX only provides a coarse circle, and computes exact `distance_km` and `walking_minutes_est`.
+  - Use `resolve_location(city="Київ", address="метро Золоті Ворота")` to inspect exact GPS coordinates of any landmark or street address.
 - Multi-component build (e.g., dual-socket AI PC) → create one campaign per component slot (`Motherboard`, `2x CPU`, `ECC RAM`, `GPU`, `PSU`) **plus** one bundle campaign (`комплект X99 dual / 2x Xeon`) to compare bundle vs parts total.
 - Always run `benchmark_market_price` before evaluating any listing — strips cheap cases/boxes/broken-parts noise (`<22%` of rough median) and computes `p10`, `p25`, `median`, `p75`, and per-offer `leverage_score`.
 - **Never trust `stats` from a bare query.** The raw search mixes in whole PCs, accessories, other models and broken cards. A first RTX 3090 run with only `min_valid_price` gave a median of 95 250 UAH (real used 3090s: about 16 500–20 000), and the wrong conclusion "the market starts at 70 000" came from it. Always set:
@@ -39,15 +42,16 @@ Drive single-item purchases and multi-component hardware builds on `olx.ua` with
 - A budget far below the cleaned `p10` (target 10 000 vs a cheapest working lot of 16 500) will not be met by haggling. Say so, then offer: broken cards for repair (risky), haggle the cheapest working lot to about 14–15 000, a lower tier of the part, or a watch campaign.
 
 ### Step 2: Persist Lot Dossier & Pitch to User (`save_lot_handoff` — Mandatory Pre-Haggle Gate)
+- **Round every offer and target price to `50` or `00` UAH** (multiples of `50 UAH`). Never propose odd 10-UAH steps (`960`, `1020`, `770`, `820`): e.g., on a `1000 UAH` listing, open at `900` (or `850` to test seller reaction) aiming to settle at `950`.
 - For each top candidate (`1..3` per slot), call `save_lot_handoff` with:
   - `build_slot`: component role in the build
   - `why_shortlisted`: why this offer beats the market (`vs_median_pct`, `has_delivery`, seller tenure)
-  - `target_price` and `walk_away_price`
+  - `target_price` and `walk_away_price` (both rounded to multiples of `50 UAH`)
   - `risks_and_questions`: technical checks to ask the seller (socket pins, working RAM channels, SMART/furmark, OLX Delivery)
   - `next_step`: `"Await user approval to send opening offer"`
 - Present the shortlist to the user **before sending any message**:
   - Current asking price vs market median (`stats.median_market`) and `p25` (`stats.p25_good_deal`)
-  - Forecasted discount (`500–1000 UAH` step-down on hardware or `8%–16%` via `haggling.suggested_opening_offer` and `haggling.suggested_target_price`)
+  - Forecasted discount rounded to `50` or `100 UAH` increments (`500–1000 UAH` step-down on hardware or `100–200 UAH` on ~1000 UAH items, always ending in `00` or `50`)
   - Exact Ukrainian draft message and direct OLX URL
 - **Never call `send_seller_message` with `dry_run=False` for cold outreach until the user approves the candidate lot(s).**
 
@@ -68,9 +72,9 @@ Drive single-item purchases and multi-component hardware builds on `olx.ua` with
 
 The olx tools are not always loaded in a session. `scripts/olx_probe.py` drives `OlxBuyerService` directly. It never sends a message to a seller.
 
-`python3 scripts/olx_probe.py "<query>" [--city X] [--min-valid N] [--max-price N] [--exclude "a,b,c"] [--category ID] [--condition used|new] [--sample N] [--all]`
+`python3 scripts/olx_probe.py "<query>" [--city X] [--district D] [--near "метро Осокорки, Київ"] [--radius 1.0] [--min-valid N] [--max-price N] [--exclude "a,b,c"] [--category ID] [--condition used|new] [--sample N] [--all]`
 
-Read-only. Prints `auth_status`, the benchmark stats and the candidates; `--all` lists every candidate and every excluded lot with its reason.
+Read-only. Prints `auth_status`, the benchmark stats and the candidates (with `distance_km` and `walking_minutes_est` when `--near` is set); `--all` lists every candidate and every excluded lot with its reason.
 
 ## Known Issues & Fixes
 

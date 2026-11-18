@@ -183,10 +183,13 @@ class AuthVault:
 
         env_token = os.environ.get("OLX_ACCESS_TOKEN", "").strip()
         env_cookie = os.environ.get("OLX_COOKIE", "").strip()
+        env_gmaps = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
         if env_token:
             data["access_token"] = env_token
         if env_cookie:
             data["cookie"] = env_cookie
+        if env_gmaps:
+            data["google_maps_api_key"] = env_gmaps
 
         if not data.get("access_token") and data.get("cookie"):
             m = _COOKIE_TOKEN_RE.search(str(data["cookie"]))
@@ -207,6 +210,7 @@ class AuthVault:
         cookie: str | None = None,
         refresh_token: str | None = None,
         raw_curl_or_headers: str | None = None,
+        google_maps_api_key: str | None = None,
         note: str | None = None,
     ) -> dict[str, Any]:
         current = self.load()
@@ -234,6 +238,8 @@ class AuthVault:
                     current["refresh_token"] = urllib.parse.unquote(m.group(1).strip())
         if refresh_token is not None:
             current["refresh_token"] = refresh_token.strip()
+        if google_maps_api_key is not None:
+            current["google_maps_api_key"] = google_maps_api_key.strip()
         if note is not None:
             current["note"] = note.strip()
         current["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -251,8 +257,14 @@ class AuthVault:
 
         return self.status_summary(verify_live=False)
 
-    def refresh_access_token(self, *, base_url: str = "https://www.olx.ua") -> dict[str, Any]:
-        """Refresh the OLX OAuth `access_token` using a stored `refresh_token` or persistent headless Chrome profile."""
+    def refresh_access_token(
+        self,
+        *,
+        base_url: str = "https://www.olx.ua",
+        allow_interactive_fallback: bool = False,
+        interactive_timeout_seconds: int = 180,
+    ) -> dict[str, Any]:
+        """Refresh the OLX OAuth `access_token` using a stored `refresh_token`, headless Chrome profile, or visible Chrome login window."""
         creds = self.load()
         refresh_tok = creds.get("refresh_token")
         if refresh_tok:
@@ -291,7 +303,14 @@ class AuthVault:
                         refresh_token=str(new_refresh),
                         note="Auto-refreshed via OAuth refresh_token",
                     )
-                    return {"refreshed": True, "method": "oauth_refresh_token", "access_token_masked": mask_secret(str(new_access))}
+                    updated = self.load()
+                    return {
+                        "refreshed": True,
+                        "method": "oauth_refresh_token",
+                        "access_token": updated.get("access_token"),
+                        "cookie": updated.get("cookie"),
+                        "access_token_masked": mask_secret(str(new_access)),
+                    }
             except Exception:
                 pass
 
@@ -303,9 +322,29 @@ class AuthVault:
                 verify_after_save=False,
             )
             if res.get("authenticated"):
+                updated = self.load()
                 return {
                     "refreshed": True,
                     "method": "headless_chrome_profile",
+                    "access_token": updated.get("access_token"),
+                    "cookie": updated.get("cookie"),
+                    "access_token_masked": res.get("access_token_masked"),
+                }
+
+        if allow_interactive_fallback:
+            res = self.interactive_browser_login(
+                timeout_seconds=interactive_timeout_seconds,
+                login_url=f"{base_url.rstrip('/')}/uk/myaccount/",
+                headless=False,
+                verify_after_save=False,
+            )
+            if res.get("authenticated"):
+                updated = self.load()
+                return {
+                    "refreshed": True,
+                    "method": "interactive_browser_login",
+                    "access_token": updated.get("access_token"),
+                    "cookie": updated.get("cookie"),
                     "access_token_masked": res.get("access_token_masked"),
                 }
 
@@ -502,17 +541,36 @@ class AuthVault:
             return float(exp) > (time.time() + min_ttl_seconds)
         return True
 
-    def build_client(self, *, base_url: str = "https://www.olx.ua", auto_refresh: bool = True) -> OlxClient:
+    def build_client(
+        self,
+        *,
+        base_url: str = "https://www.olx.ua",
+        auto_refresh: bool = True,
+        allow_interactive_fallback: bool | None = None,
+    ) -> OlxClient:
+        if allow_interactive_fallback is None:
+            allow_interactive_fallback = os.environ.get("OLX_MCP_NO_INTERACTIVE_LOGIN", "").strip() not in ("1", "true", "yes")
         creds = self.load()
         tok = creds.get("access_token")
         if auto_refresh and tok and not self._is_token_fresh(tok):
-            ref = self.refresh_access_token(base_url=base_url)
+            ref = self.refresh_access_token(
+                base_url=base_url,
+                allow_interactive_fallback=bool(allow_interactive_fallback),
+            )
             if ref.get("refreshed"):
                 creds = self.load()
+
+        def _recover_expired_auth() -> dict[str, Any]:
+            return self.refresh_access_token(
+                base_url=base_url,
+                allow_interactive_fallback=bool(allow_interactive_fallback),
+            )
+
         return OlxClient(
             base_url=base_url,
             access_token=creds.get("access_token"),
             cookie=creds.get("cookie"),
+            on_auth_expired=_recover_expired_auth if auto_refresh else None,
         )
 
     def _decode_jwt_claims(self, token: str | None) -> dict[str, Any]:
@@ -550,6 +608,7 @@ class AuthVault:
             "access_token_masked": mask_secret(raw_tok),
             "refresh_token_masked": mask_secret(creds.get("refresh_token")),
             "cookie_masked": mask_secret(creds.get("cookie")),
+            "google_maps_api_key_masked": mask_secret(creds.get("google_maps_api_key")),
             "user_uuid": claims.get("sub"),
             "token_expires_at": exp_iso,
             "updated_at": creds.get("updated_at"),
@@ -574,8 +633,12 @@ class AuthVault:
                     "active_conversations_sample": len(convs),
                 }
             except OlxApiError as exc:
-                if exc.status_code == 401 and client is None:
-                    ref_res = self.refresh_access_token(base_url=cli.base_url)
+                if exc.status_code in (401, 403) and client is None:
+                    allow_interactive = os.environ.get("OLX_MCP_NO_INTERACTIVE_LOGIN", "").strip() not in ("1", "true", "yes")
+                    ref_res = self.refresh_access_token(
+                        base_url=cli.base_url,
+                        allow_interactive_fallback=allow_interactive,
+                    )
                     if ref_res.get("refreshed"):
                         cli = self.build_client(base_url=cli.base_url, auto_refresh=False)
                         conv_res = cli.request_chat_json("GET", "/api/conversations", params={"offset": 0, "limit": 1})

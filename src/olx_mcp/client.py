@@ -291,11 +291,29 @@ class OlxClient:
         access_token: str | None = None,
         cookie: str | None = None,
         timeout: float = 15.0,
+        on_auth_expired: Any = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.access_token = access_token
         self.cookie = cookie
         self.timeout = timeout
+        self.on_auth_expired = on_auth_expired
+
+    def _try_auth_recovery(self) -> bool:
+        """Invoke `on_auth_expired` callback (silent refresh -> interactive Chrome login) and update credentials in place."""
+        if not callable(self.on_auth_expired):
+            return False
+        try:
+            ref = self.on_auth_expired()
+            if isinstance(ref, dict) and (ref.get("refreshed") or ref.get("authenticated")):
+                if ref.get("access_token"):
+                    self.access_token = str(ref["access_token"])
+                if ref.get("cookie"):
+                    self.cookie = str(ref["cookie"])
+                return True
+        except Exception:
+            pass
+        return False
 
     def _headers(
         self,
@@ -310,6 +328,8 @@ class OlxClient:
             "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
             "Referer": f"{self.base_url}/uk/",
         }
+        if require_auth and not self.access_token and not self.cookie:
+            self._try_auth_recovery()
         if self.access_token:
             tok = self.access_token.strip()
             if not tok.lower().startswith("bearer "):
@@ -362,6 +382,18 @@ class OlxClient:
                 err_body = exc.read().decode("utf-8", errors="replace")[:800]
             except Exception:
                 pass
+            if exc.code in (401, 403) and ("The request could not be satisfied" not in err_body and "CloudFront" not in err_body):
+                if self._try_auth_recovery():
+                    retry_headers = self._headers(require_auth=require_auth)
+                    if json_body is not None:
+                        retry_headers["Content-Type"] = "application/json"
+                    retry_req = urllib.request.Request(url, data=body_bytes, headers=retry_headers, method=method.upper())
+                    try:
+                        with urllib.request.urlopen(retry_req, timeout=self.timeout) as resp:
+                            raw_bytes = resp.read()
+                            return json.loads(raw_bytes.decode("utf-8", errors="replace")) if raw_bytes else {}
+                    except Exception:
+                        pass
             if exc.code == 403 and ("The request could not be satisfied" in err_body or "CloudFront" in err_body):
                 for persistent in (False, True):
                     cdp_res = self._request_via_chrome_cdp(
@@ -370,6 +402,17 @@ class OlxClient:
                         headers=headers,
                         json_body=json_body,
                         persistent=persistent,
+                    )
+                    if cdp_res is not None:
+                        return cdp_res
+                if self._try_auth_recovery():
+                    retry_headers = self._headers(require_auth=require_auth)
+                    cdp_res = self._request_via_chrome_cdp(
+                        method=method.upper(),
+                        url=url,
+                        headers=retry_headers,
+                        json_body=json_body,
+                        persistent=True,
                     )
                     if cdp_res is not None:
                         return cdp_res
@@ -428,6 +471,28 @@ class OlxClient:
                 return json.loads(body_text) if body_text.strip() else {}
             if status == 403 and ("The request could not be satisfied" in body_text or "CloudFront" in body_text):
                 return None
+            if status in (401, 403) and self._try_auth_recovery():
+                if self.access_token:
+                    tok = self.access_token.strip()
+                    fetch_headers["Authorization"] = tok if tok.lower().startswith("bearer ") else f"Bearer {tok}"
+                    fetch_opts["headers"] = fetch_headers
+                    retry_js = (
+                        f"fetch({json.dumps(url)}, {json.dumps(fetch_opts)})"
+                        ".then(async r => JSON.stringify({status: r.status, text: await r.text()}))"
+                    )
+                    retry_res = ws_cdp_call(
+                        ws_url,
+                        "Runtime.evaluate",
+                        {"expression": retry_js, "awaitPromise": True, "returnByValue": True},
+                        timeout=self.timeout,
+                    )
+                    retry_val = ((retry_res.get("result") or {}).get("value")) or ""
+                    if retry_val:
+                        retry_parsed = json.loads(retry_val)
+                        r_status = int(retry_parsed.get("status") or 0)
+                        r_text = str(retry_parsed.get("text") or "")
+                        if 200 <= r_status < 300:
+                            return json.loads(r_text) if r_text.strip() else {}
             raise OlxApiError(status, body_text[:500], url)
         except OlxApiError:
             raise
@@ -478,6 +543,31 @@ class OlxClient:
                 err_body = exc.read().decode("utf-8", errors="replace")[:800]
             except Exception:
                 pass
+            if exc.code in (401, 403) and self._try_auth_recovery():
+                retry_headers = self._headers(
+                    require_auth=True,
+                    extra={
+                        "X-Site-Code": "olxua",
+                        "X-Client": "DESKTOP",
+                        "X-Api-Version": "2",
+                        "Origin": "https://www.olx.ua",
+                        "Referer": "https://www.olx.ua/",
+                    },
+                )
+                if json_body is not None:
+                    retry_headers["Content-Type"] = "application/json"
+                retry_req = urllib.request.Request(url, data=body_bytes, headers=retry_headers, method=method.upper())
+                try:
+                    with urllib.request.urlopen(retry_req, timeout=self.timeout) as resp:
+                        raw_bytes = resp.read()
+                        return json.loads(raw_bytes.decode("utf-8", errors="replace")) if raw_bytes else {}
+                except urllib.error.HTTPError as retry_exc:
+                    retry_err = ""
+                    try:
+                        retry_err = retry_exc.read().decode("utf-8", errors="replace")[:800]
+                    except Exception:
+                        pass
+                    raise OlxApiError(retry_exc.code, retry_err or str(retry_exc.reason), url) from retry_exc
             raise OlxApiError(exc.code, err_body or str(exc.reason), url) from exc
         except urllib.error.URLError as exc:
             raise OlxApiError(503, f"Network error: {exc.reason}", url) from exc
@@ -495,6 +585,9 @@ class OlxClient:
         condition: str | None = None,
         sort_by: str = "relevance",
         only_with_delivery: bool = False,
+        lat: float | None = None,
+        lon: float | None = None,
+        dist_km: int | None = None,
         offset: int = 0,
         limit: int = 40,
     ) -> dict[str, Any]:
@@ -521,6 +614,11 @@ class OlxClient:
             params["filter_enum_state[0]"] = condition
         if only_with_delivery:
             params["delivery_scheduled"] = "true"
+        if lat is not None and lon is not None:
+            params["latitude"] = round(float(lat), 6)
+            params["longitude"] = round(float(lon), 6)
+            if dist_km is not None:
+                params["dist"] = max(2, int(dist_km))
 
         raw = self.request_json("GET", "/api/v1/offers/", params=params)
         items = raw.get("data") or []

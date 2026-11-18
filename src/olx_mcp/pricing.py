@@ -56,6 +56,13 @@ def _percentile(sorted_vals: list[float], pct: float) -> float:
     return round(sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac, 2)
 
 
+def _round_to_50(value: float) -> float:
+    """Round haggling offers and targets to clean multiples of 50 UAH (ending in 00 or 50)."""
+    if value < 100:
+        return round(value, -1)
+    return float(int(round(value / 50.0) * 50))
+
+
 def compute_haggling_leverage(
     offer: OfferSummary,
     market_median: float,
@@ -108,9 +115,9 @@ def compute_haggling_leverage(
             raw_open_disc = min(max(raw_open_disc, 500.0), 1200.0)
         raw_target_disc = max(price * target_discount, 300.0 if price >= 3500 else price * 0.05)
 
-        suggested_opening = round(min(price - raw_open_disc, market_p25 * 0.95 if market_p25 > 0 else price), -1)
-        suggested_opening = max(suggested_opening, round(price * 0.72, -1))
-        suggested_target = round(min(price - raw_target_disc, market_median if market_median > 0 else price), -1)
+        suggested_opening = _round_to_50(min(price - raw_open_disc, market_p25 * 0.95 if market_p25 > 0 else price))
+        suggested_opening = max(suggested_opening, _round_to_50(price * 0.72))
+        suggested_target = _round_to_50(min(price - raw_target_disc, market_median if market_median > 0 else price))
         suggested_target = max(suggested_target, suggested_opening)
     else:
         suggested_opening = 0.0
@@ -206,9 +213,9 @@ def benchmark_offers(
     p75 = _percentile(prices, 75)
     mean = round(statistics.mean(prices), 2)
 
-    recommended_opening = round(p25 * 0.88, -1) if p25 >= 100 else round(p25 * 0.88, 2)
-    target_buy_price = round(p25 * 0.96, -1) if p25 >= 100 else round(p25 * 0.96, 2)
-    walk_away_price = round(median, -1) if median >= 100 else round(median, 2)
+    recommended_opening = _round_to_50(p25 * 0.88) if p25 >= 100 else round(p25 * 0.88, 2)
+    target_buy_price = _round_to_50(p25 * 0.96) if p25 >= 100 else round(p25 * 0.96, 2)
+    walk_away_price = _round_to_50(median) if median >= 100 else round(median, 2)
 
     candidates: list[dict[str, Any]] = []
     for off in priced_offers:

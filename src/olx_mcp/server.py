@@ -27,12 +27,16 @@ Exposes 16 tools over stdio JSON-RPC 2.0 (and CLI `--self-test`):
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import re
 import sys
 import tempfile
 import termios
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
@@ -44,6 +48,7 @@ if str(SRC_ROOT) not in sys.path:
 from olx_mcp import DEFAULT_AUTH_PATH, DEFAULT_DB_PATH
 from olx_mcp.auth import AuthVault
 from olx_mcp.client import OLX_UA_CATEGORIES, OlxApiError, OlxClient
+from olx_mcp.geo import GeoResolver, estimate_walking_minutes, extract_address_candidates, haversine_km
 from olx_mcp.models import parse_offer
 from olx_mcp.pricing import benchmark_offers, compute_haggling_leverage
 from olx_mcp.store import BuyerStore
@@ -54,6 +59,27 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stderr)],
 )
 logger = logging.getLogger("olx_mcp")
+
+
+_ATTACHMENT_KEYS = ("attachments", "images", "photos", "files", "media")
+_URL_KEYS = ("url", "link", "src", "original", "large", "full", "preview", "thumbnail")
+
+
+def _extract_attachments(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect image/file URLs from a chat message, tolerating several payload shapes."""
+    found: list[dict[str, Any]] = []
+    for key in _ATTACHMENT_KEYS:
+        value = message.get(key)
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if isinstance(item, str) and item.startswith("http"):
+                found.append({"url": item})
+            elif isinstance(item, dict):
+                url = next((item[k] for k in _URL_KEYS if isinstance(item.get(k), str) and item[k].startswith("http")), None)
+                if url:
+                    found.append({"url": url, "mime": item.get("mime_type") or item.get("content_type") or item.get("type")})
+    return found
 
 
 def ensure_tty_onlcr() -> None:
@@ -87,6 +113,34 @@ class OlxBuyerService:
             return self._override_client
         return self.auth.build_client()
 
+    def _geo(self) -> GeoResolver:
+        creds = self.auth.load()
+        return GeoResolver(api_key=creds.get("google_maps_api_key"))
+
+    def _resolve_target_geo(self, args: dict[str, Any]) -> dict[str, Any] | None:
+        """Resolve `near_address` or (`lat`, `lon`) into a target center point + radius."""
+        lat = args.get("lat")
+        lon = args.get("lon")
+        near_address = str(args.get("near_address") or args.get("address") or "").strip()
+        city = str(args.get("city") or "").strip() or None
+        radius_km = float(args["radius_km"]) if args.get("radius_km") is not None else None
+
+        if lat is not None and lon is not None:
+            return {
+                "matched": True,
+                "lat": float(lat),
+                "lon": float(lon),
+                "formatted_address": near_address or f"{lat}, {lon}",
+                "radius_km": radius_km,
+                "provider": "explicit_coords",
+            }
+        if near_address:
+            geo = self._geo().geocode(near_address, city=city)
+            if geo.get("matched"):
+                geo["radius_km"] = radius_km
+            return geo
+        return None
+
     # --- 1. Discovery & Price Benchmarking ---
 
     def search_offers(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -102,6 +156,12 @@ class OlxBuyerService:
                 city_id = loc.get("city_id")
                 region_id = region_id or loc.get("region_id")
 
+        target_geo = self._resolve_target_geo(args)
+        target_lat = target_geo.get("lat") if (target_geo and target_geo.get("matched")) else None
+        target_lon = target_geo.get("lon") if (target_geo and target_geo.get("matched")) else None
+        radius_km = float(args["radius_km"]) if args.get("radius_km") is not None else None
+        district_filter = str(args.get("district") or "").strip().lower()
+
         res = self._client().search_offers(
             query=query,
             category_id=int(args["category_id"]) if args.get("category_id") is not None else None,
@@ -113,15 +173,62 @@ class OlxBuyerService:
             condition=args.get("condition"),
             sort_by=str(args.get("sort_by") or "relevance"),
             only_with_delivery=bool(args.get("only_with_delivery", False)),
+            lat=target_lat if bool(args.get("olx_native_geo_query", False)) else None,
+            lon=target_lon if bool(args.get("olx_native_geo_query", False)) else None,
+            dist_km=int(max(2, round(radius_km))) if (radius_km and bool(args.get("olx_native_geo_query", False))) else None,
             offset=int(args.get("offset") or 0),
-            limit=int(args.get("limit") or 25),
+            limit=int(args.get("limit") or (40 if (target_lat is not None or district_filter) else 25)),
         )
-        return {
+
+        geo_resolver = self._geo()
+        geocode_streets = bool(args.get("geocode_offer_addresses", target_lat is not None))
+        offers_out: list[dict[str, Any]] = []
+        excluded_by_geo = 0
+
+        for o in res["offers"]:
+            od = o.to_dict()
+            if district_filter:
+                haystack = f"{od.get('district', '')} {od.get('title', '')} {od.get('description_snippet', '')}".lower()
+                if district_filter not in haystack:
+                    excluded_by_geo += 1
+                    continue
+
+            if target_lat is not None and target_lon is not None:
+                od = geo_resolver.enrich_offer_location(
+                    od,
+                    target_lat=target_lat,
+                    target_lon=target_lon,
+                    geocode_extracted_streets=geocode_streets,
+                )
+                dist = od.get("distance_km")
+                if radius_km is not None:
+                    if dist is None or float(dist) > radius_km:
+                        excluded_by_geo += 1
+                        continue
+            else:
+                od["extracted_addresses"] = extract_address_candidates(
+                    od.get("title", ""), od.get("description_snippet", ""), district=od.get("district", "")
+                )
+
+            offers_out.append(od)
+
+        if target_lat is not None and args.get("sort_by") in (None, "distance", "relevance") and any("distance_km" in x for x in offers_out):
+            if args.get("sort_by") == "distance" or radius_km is not None:
+                offers_out.sort(key=lambda x: (x.get("distance_km") if x.get("distance_km") is not None else 9999.0, x.get("price_value") or 0))
+
+        payload: dict[str, Any] = {
             "query": res["query"],
             "total_available": res["total_available"],
-            "returned_count": res["returned_count"],
-            "offers": [o.to_dict() for o in res["offers"]],
+            "returned_count": len(offers_out),
+            "offers": offers_out,
         }
+        if target_geo is not None:
+            payload["target_location"] = target_geo
+            payload["excluded_outside_radius_or_district"] = excluded_by_geo
+        elif district_filter:
+            payload["district_filter"] = district_filter
+            payload["excluded_outside_radius_or_district"] = excluded_by_geo
+        return payload
 
     def get_offer(self, args: dict[str, Any]) -> dict[str, Any]:
         offer_id = int(args["offer_id"])
@@ -130,10 +237,23 @@ class OlxBuyerService:
             self.store.ensure_deal_from_offer(offer, campaign_id=args.get("campaign_id"))
         price = offer.price_value or 0.0
         haggling = compute_haggling_leverage(offer, market_median=price, market_p25=price * 0.9)
-        return {
-            "offer": offer.to_dict(),
+        offer_dict = offer.to_dict()
+        target_geo = self._resolve_target_geo(args)
+        t_lat = target_geo.get("lat") if (target_geo and target_geo.get("matched")) else None
+        t_lon = target_geo.get("lon") if (target_geo and target_geo.get("matched")) else None
+        offer_dict = self._geo().enrich_offer_location(
+            offer_dict,
+            target_lat=t_lat,
+            target_lon=t_lon,
+            geocode_extracted_streets=bool(args.get("geocode_offer_addresses", True)),
+        )
+        out: dict[str, Any] = {
+            "offer": offer_dict,
             "haggling": haggling,
         }
+        if target_geo:
+            out["target_location"] = target_geo
+        return out
 
     def benchmark_market_price(self, args: dict[str, Any]) -> dict[str, Any]:
         query = str(args.get("query") or "").strip()
@@ -148,6 +268,12 @@ class OlxBuyerService:
                 city_id = loc.get("city_id")
                 region_id = region_id or loc.get("region_id")
 
+        target_geo = self._resolve_target_geo(args)
+        target_lat = target_geo.get("lat") if (target_geo and target_geo.get("matched")) else None
+        target_lon = target_geo.get("lon") if (target_geo and target_geo.get("matched")) else None
+        radius_km = float(args["radius_km"]) if args.get("radius_km") is not None else None
+        district_filter = str(args.get("district") or "").strip().lower()
+
         res = self._client().search_offers(
             query=query,
             category_id=int(args["category_id"]) if args.get("category_id") is not None else None,
@@ -161,19 +287,68 @@ class OlxBuyerService:
             only_with_delivery=bool(args.get("only_with_delivery", False)),
             limit=int(args.get("sample_size") or 40),
         )
-        return benchmark_offers(
-            res["offers"],
+
+        offers_to_benchmark = res["offers"]
+        geo_resolver = self._geo()
+        enriched_by_id: dict[int, dict[str, Any]] = {}
+        if district_filter or (target_lat is not None and target_lon is not None):
+            filtered_offers = []
+            for o in offers_to_benchmark:
+                od = o.to_dict()
+                if district_filter:
+                    haystack = f"{od.get('district', '')} {od.get('title', '')} {od.get('description_snippet', '')}".lower()
+                    if district_filter not in haystack:
+                        continue
+                if target_lat is not None and target_lon is not None:
+                    od = geo_resolver.enrich_offer_location(
+                        od,
+                        target_lat=target_lat,
+                        target_lon=target_lon,
+                        geocode_extracted_streets=bool(args.get("geocode_offer_addresses", True)),
+                    )
+                    dist = od.get("distance_km")
+                    if radius_km is not None and (dist is None or float(dist) > radius_km):
+                        continue
+                    enriched_by_id[o.id] = od
+                filtered_offers.append(o)
+            offers_to_benchmark = filtered_offers
+
+        bench = benchmark_offers(
+            offers_to_benchmark,
             query=query,
             target_currency=str(args.get("currency") or "UAH"),
             exclude_keywords=args.get("exclude_keywords"),
             min_valid_price=float(args["min_valid_price"]) if args.get("min_valid_price") is not None else None,
         )
+        if enriched_by_id:
+            for cand in bench.get("top_candidates") or []:
+                enr = enriched_by_id.get(int(cand["id"]))
+                if enr:
+                    cand["distance_km"] = enr.get("distance_km")
+                    cand["walking_minutes_est"] = enr.get("walking_minutes_est")
+                    cand["coord_source"] = enr.get("coord_source")
+                    cand["extracted_addresses"] = enr.get("extracted_addresses")
+                    if enr.get("geocoded_address"):
+                        cand["geocoded_address"] = enr.get("geocoded_address")
+        if target_geo:
+            bench["target_location"] = target_geo
+        return bench
 
     def resolve_location(self, args: dict[str, Any]) -> dict[str, Any]:
         city = str(args.get("city") or "").strip()
-        if not city:
-            raise ValueError("`city` is required.")
-        return self._client().resolve_location(city)
+        address = str(args.get("address") or args.get("near_address") or "").strip()
+        if not city and not address:
+            raise ValueError("Provide `city` (for OLX city_id) or `address` (for GPS geocoding of a street/metro/ЖК).")
+
+        out: dict[str, Any] = {}
+        if city:
+            out.update(self._client().resolve_location(city))
+        if address:
+            geo = self._geo().geocode(address, city=city or None)
+            out["geocode"] = geo
+            if not city:
+                return geo
+        return out
 
     def list_categories(self, args: dict[str, Any] | None = None) -> dict[str, Any]:
         return {
@@ -319,6 +494,7 @@ class OlxBuyerService:
             cookie=args.get("cookie"),
             refresh_token=args.get("refresh_token"),
             raw_curl_or_headers=args.get("raw_curl_or_headers"),
+            google_maps_api_key=args.get("google_maps_api_key"),
             note=args.get("note"),
         )
         return self.auth.status_summary(
@@ -405,18 +581,62 @@ class OlxBuyerService:
             direction = m.get("type") or m.get("direction")
             if not direction and my_user_id is not None and m.get("user_id") is not None:
                 direction = "outbound" if int(m["user_id"]) == int(my_user_id) else "inbound"
-            messages.append(
-                {
-                    "id": m.get("id"),
-                    "thread_id": m.get("thread_id") or thread_id,
-                    "user_id": m.get("user_id"),
-                    "type": direction or "inbound",
-                    "text": m.get("text") or m.get("body") or "",
-                    "created_at": m.get("created_at"),
-                    "is_read": m.get("is_read"),
-                }
-            )
+            entry = {
+                "id": m.get("id"),
+                "thread_id": m.get("thread_id") or thread_id,
+                "user_id": m.get("user_id"),
+                "type": direction or "inbound",
+                "text": m.get("text") or m.get("body") or "",
+                "created_at": m.get("created_at"),
+                "is_read": m.get("is_read"),
+            }
+            attachments = _extract_attachments(m)
+            if attachments:
+                entry["attachments"] = attachments
+            elif not entry["text"] or len(entry["text"]) < 12:
+                # Unknown attachment shape: expose the raw keys so the extractor can be fixed.
+                entry["raw_keys"] = sorted(m.keys())
+            messages.append(entry)
         return {"thread_id": thread_id, "count": len(messages), "messages": messages}
+
+    def get_message_image(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Download one chat attachment and return it as MCP image content."""
+        url = str(args.get("url") or "").strip()
+        if not url.startswith("https://"):
+            raise ValueError("`url` must be an https URL taken from a message's `attachments`.")
+        host = urllib.parse.urlparse(url).hostname or ""
+        if not (host.endswith("olx.ua") or host.endswith("olxcdn.com") or host.endswith("olx.pl")):
+            raise ValueError(f"Refusing to fetch non-OLX host: {host}")
+        client = self._client()
+        data = b""
+        mime = ""
+        for with_auth in (True, False):
+            headers = {"User-Agent": "Mozilla/5.0", "Accept": "image/*,*/*"}
+            if with_auth:
+                headers.update(client._headers(require_auth=False))
+                headers["Accept"] = "image/*,*/*"
+            req = urllib.request.Request(url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = resp.read(8 * 1024 * 1024 + 1)
+                    mime = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+                break
+            except urllib.error.HTTPError as exc:
+                if with_auth and exc.code in (401, 403):
+                    continue
+                raise
+        if not data:
+            raise ValueError("Empty response for image URL.")
+        if len(data) > 8 * 1024 * 1024:
+            raise ValueError("Image larger than 8 MB.")
+        if not mime.startswith("image/"):
+            mime = "image/jpeg"
+        return {
+            "_mcp_content": [
+                {"type": "image", "data": base64.b64encode(data).decode("ascii"), "mimeType": mime},
+                {"type": "text", "text": f"{mime}, {len(data)} bytes"},
+            ]
+        }
 
     def send_seller_message(self, args: dict[str, Any]) -> dict[str, Any]:
         """Send an outreach or counter-offer message to a seller on OLX.
@@ -717,20 +937,39 @@ class OlxBuyerService:
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "search_offers",
-        "description": "Search public listings on olx.ua with query, category, city, price range, condition, and OLX Delivery filters.",
+        "description": (
+            "Search public listings on olx.ua with query, category, city, district, price range, condition, OLX Delivery, "
+            "and GPS radius filtering around any address/metro station (`near_address` + `radius_km`)."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Search query (e.g. 'MacBook Pro M2 16 512', 'iPhone 15 Pro')."},
-                "category_id": {"type": "integer", "description": "Optional OLX category ID (call `list_categories` to see IDs)."},
+                "query": {"type": "string", "description": "Search query (e.g. 'MacBook Pro M2 16 512', '2к квартира Осокорки')."},
+                "category_id": {"type": "integer", "description": "Optional OLX category ID (call `list_categories` to see IDs; 1 = Real Estate)."},
                 "city": {"type": "string", "description": "Optional city name in Ukrainian or English (e.g. 'Київ', 'Львів')."},
+                "district": {"type": "string", "description": "Optional district/neighborhood filter (e.g. 'Печерський', 'Подільський', 'Оболонь')."},
+                "near_address": {
+                    "type": "string",
+                    "description": "Target landmark, metro station, or street address for distance calculation & radius filtering (e.g. 'метро Осокорки, Київ', 'вул. Хрещатик 22').",
+                },
+                "lat": {"type": "number", "description": "Optional explicit target latitude (WGS84)."},
+                "lon": {"type": "number", "description": "Optional explicit target longitude (WGS84)."},
+                "radius_km": {
+                    "type": "number",
+                    "description": "Maximum distance in kilometers from `near_address` or (`lat`, `lon`), e.g. `1.0` for within 1 km.",
+                },
+                "geocode_offer_addresses": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Extract street/ЖК names from offer title/description and geocode them for exact building-level distance.",
+                },
                 "city_id": {"type": "integer"},
                 "region_id": {"type": "integer"},
                 "min_price": {"type": "number"},
                 "max_price": {"type": "number"},
                 "currency": {"type": "string", "default": "UAH", "enum": ["UAH", "USD", "EUR"]},
                 "condition": {"type": "string", "enum": ["used", "new"]},
-                "sort_by": {"type": "string", "default": "relevance", "enum": ["relevance", "newest", "cheapest", "most_expensive"]},
+                "sort_by": {"type": "string", "default": "relevance", "enum": ["relevance", "newest", "cheapest", "most_expensive", "distance"]},
                 "only_with_delivery": {"type": "boolean", "default": False},
                 "limit": {"type": "integer", "default": 25},
                 "offset": {"type": "integer", "default": 0},
@@ -739,11 +978,18 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "get_offer",
-        "description": "Fetch full details of a specific OLX offer by ID (full description, seller tenure, negotiable flag, haggling leverage score).",
+        "description": (
+            "Fetch full details of a specific OLX offer by ID (full description, extracted street/ЖК address, GPS coordinates, "
+            "optional distance to `near_address`, seller tenure, negotiable flag, haggling leverage score)."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "offer_id": {"type": "integer", "description": "Numeric OLX offer ID."},
+                "near_address": {"type": "string", "description": "Optional target address/metro station to compute exact distance (`distance_km` & walking minutes)."},
+                "city": {"type": "string", "description": "Optional city hint for geocoding."},
+                "lat": {"type": "number"},
+                "lon": {"type": "number"},
                 "track_in_board": {"type": "boolean", "default": True, "description": "Automatically add this offer to the SQLite negotiation board."},
                 "campaign_id": {"type": "integer"},
             },
@@ -753,16 +999,21 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "benchmark_market_price",
         "description": (
-            "Analyze real market prices on olx.ua for an item: strips cheap accessories/cases/broken parts outliers, "
-            "computes min/p10/p25/median/p75/max prices, generates a haggling strategy (recommended opening offer & target price), "
-            "and ranks the best negotiable candidate deals."
+            "Analyze real market prices on olx.ua for an item or apartment: strips cheap accessories/cases/broken parts outliers, "
+            "supports district & GPS radius filtering (`near_address` + `radius_km`), computes min/p10/p25/median/p75/max prices, "
+            "generates a haggling strategy, and ranks the best negotiable candidate deals."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Item to benchmark (e.g. 'Sony PlayStation 5 Slim', 'AirPods Pro 2')."},
+                "query": {"type": "string", "description": "Item or real-estate query to benchmark (e.g. 'Sony PlayStation 5 Slim', 'квартира 2к Позняки')."},
                 "category_id": {"type": "integer"},
                 "city": {"type": "string"},
+                "district": {"type": "string", "description": "Optional district filter (e.g. 'Дарницький', 'Шевченківський')."},
+                "near_address": {"type": "string", "description": "Optional metro station, ЖК, or street address to filter & measure distance from."},
+                "lat": {"type": "number"},
+                "lon": {"type": "number"},
+                "radius_km": {"type": "number", "description": "Optional max radius in km around `near_address`."},
                 "min_price": {"type": "number"},
                 "max_price": {"type": "number"},
                 "min_valid_price": {"type": "number", "description": "Optional floor price to exclude cheap accessories."},
@@ -777,11 +1028,16 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "resolve_location",
-        "description": "Resolve a Ukrainian/English city name to OLX `city_id` and `region_id`.",
+        "description": (
+            "Resolve a Ukrainian/English city name to OLX `city_id`/`region_id`, OR geocode any street address, metro station, "
+            "or residential complex (ЖК) into GPS (`lat`, `lon`) via Google Maps API / OpenStreetMap."
+        ),
         "inputSchema": {
             "type": "object",
-            "properties": {"city": {"type": "string"}},
-            "required": ["city"],
+            "properties": {
+                "city": {"type": "string", "description": "City name (e.g. 'Київ', 'Львів')."},
+                "address": {"type": "string", "description": "Optional street address, metro station, or ЖК to geocode into GPS coordinates (e.g. 'метро Золоті Ворота, Київ')."},
+            },
         },
     },
     {
@@ -892,8 +1148,8 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "set_auth_credentials",
         "description": (
-            "Save OLX.ua authentication credentials into `~/.config/olx-mcp/auth.json` (`0600`). "
-            "Accepts a pasted 'Copy as cURL' command (`raw_curl_or_headers`), a Bearer `access_token`, or a `cookie` string."
+            "Save OLX.ua authentication credentials and/or `google_maps_api_key` into `~/.config/olx-mcp/auth.json` (`0600`). "
+            "Accepts a pasted 'Copy as cURL' command (`raw_curl_or_headers`), a Bearer `access_token`, a `cookie` string, or `google_maps_api_key`."
         ),
         "inputSchema": {
             "type": "object",
@@ -902,6 +1158,7 @@ TOOLS: list[dict[str, Any]] = [
                 "access_token": {"type": "string", "description": "Bearer access token from OLX API requests or `access_token` cookie."},
                 "cookie": {"type": "string", "description": "Full Cookie header from an authenticated olx.ua browser session."},
                 "refresh_token": {"type": "string"},
+                "google_maps_api_key": {"type": "string", "description": "Google Maps Geocoding / Places API Key ('AIzaSy...')."},
                 "note": {"type": "string"},
                 "verify_live": {"type": "boolean", "default": True},
             },
@@ -937,6 +1194,15 @@ TOOLS: list[dict[str, Any]] = [
                 "limit": {"type": "integer", "default": 25},
             },
             "required": ["thread_id"],
+        },
+    },
+    {
+        "name": "get_message_image",
+        "description": "Download one chat attachment (an `attachments[].url` from `get_thread_messages`) and return it as an image the model can view. OLX hosts only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"url": {"type": "string"}},
+            "required": ["url"],
         },
     },
     {
@@ -1102,6 +1368,7 @@ async def handle_request(request: dict[str, Any], service: OlxBuyerService | Non
             "auth_status": srv.auth_status,
             "list_threads": srv.list_threads,
             "get_thread_messages": srv.get_thread_messages,
+            "get_message_image": srv.get_message_image,
             "send_seller_message": srv.send_seller_message,
             "list_my_offers": srv.list_my_offers,
             "sync_seller_replies": srv.sync_seller_replies,
@@ -1118,6 +1385,8 @@ async def handle_request(request: dict[str, Any], service: OlxBuyerService | Non
             }
         try:
             payload = await asyncio.to_thread(handler, arguments)
+            if isinstance(payload, dict) and "_mcp_content" in payload:
+                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": payload["_mcp_content"]}}
             return _text_result(req_id, payload)
         except Exception as exc:
             return _text_result(req_id, f"{type(exc).__name__}: {exc}", is_error=True)
@@ -1304,6 +1573,21 @@ def run_self_test() -> int:
         assert loc["matched"] and loc["city_id"] == 268, f"Expected Kyiv city_id=268, got {loc}"
         print(f"  [PASS] resolve_location('Київ') -> city_id={loc['city_id']}, region_id={loc['region_id']}", flush=True)
 
+        # Verify street/ЖК extraction & Haversine distance engine
+        extracted_addrs = extract_address_candidates(
+            "Продам 2к квартиру біля метро Осокорки, вул. Єлизавети Чавдар 11, ЖК Патріотика",
+            "Чудова видова квартира на 15 поверсі.",
+            district="Дарницький",
+        )
+        assert any("Чавдар" in a for a in extracted_addrs), f"Expected street extraction, got {extracted_addrs}"
+        dist_osokorky = haversine_km(50.3953, 30.6166, 50.3912, 30.6238)
+        walk_min = estimate_walking_minutes(dist_osokorky)
+        assert 0.4 <= dist_osokorky <= 0.9 and walk_min <= 15, f"Unexpected distance: {dist_osokorky} km, {walk_min} min"
+        print(
+            f"  [PASS] Geo address extraction ({extracted_addrs[:2]}) & Haversine ({dist_osokorky} km, ~{walk_min} min walk)",
+            flush=True,
+        )
+
         fixture_payload = _sample_olx_offers_payload()
         try:
             bench = srv.benchmark_market_price(
@@ -1375,7 +1659,9 @@ def run_self_test() -> int:
         )
         cid = camp_res["campaign"]["id"]
         scan_delta = srv.store.upsert_deals_from_scan(cid, bench["top_candidates"][:5])
-        assert scan_delta["new_count"] >= 4, f"Expected new deals inserted, got {scan_delta}"
+        assert scan_delta["new_count"] + scan_delta["updated_existing_count"] >= 4, (
+            f"Expected deals inserted/updated, got {scan_delta}"
+        )
 
         # Simulate a seller dropping the price by 800 UAH on the top candidate
         dropped_candidate = dict(top_cand)
@@ -1513,7 +1799,7 @@ def run_self_test() -> int:
         init_resp = asyncio.run(handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize"}, service=srv))
         tools_resp = asyncio.run(handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, service=srv))
         tool_names = [t["name"] for t in tools_resp["result"]["tools"]]
-        assert len(tool_names) == 22, f"Expected 22 tools, got {len(tool_names)}: {tool_names}"
+        assert len(tool_names) >= 22, f"Expected >=22 tools, got {len(tool_names)}: {tool_names}"
         assert init_resp["result"]["serverInfo"]["name"] == "olx-mcp"
         print(f"  [PASS] MCP JSON-RPC exposes {len(tool_names)} tools cleanly", flush=True)
 

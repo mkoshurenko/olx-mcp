@@ -14,8 +14,10 @@ Drive single-item purchases and multi-component hardware builds on `olx.ua` with
 | `~/.config/olx-mcp/lots/INDEX.md` | Master table of all tracked lots, current stage, prices, and links to per-lot dossiers |
 | `~/.config/olx-mcp/lots/lot-<OFFER_ID>.md` | Per-lot handoff dossier: build slot, shortlist rationale, target/walk-away prices, seller questions, chat log, price history |
 | `~/.config/olx-mcp/olx_buyer.sqlite3` | SQLite CRM (`campaigns`, `deals`, `price_history`, `negotiation_log`, `lot_handoffs`) |
-| `~/.config/olx-mcp/auth.json` | Mode `0600` vault storing Cognito `access_token` + session cookies (`SID`, `IDPState`, `auth0...`) |
-| `src/olx_mcp/server.py` (this repo) | MCP server implementation |
+| `~/.config/olx-mcp/auth.json` | Mode `0600` vault storing Cognito `access_token`, session cookies (`SID`, `IDPState`, `auth0...`), and optional `google_maps_api_key` |
+| `~/.config/olx-mcp/geocache.json` | Persistent geocode cache for Google Maps Geocoding API & OpenStreetMap Nominatim |
+| `src/olx_mcp/server.py` (this repo) | MCP server implementation (23 tools) |
+| `src/olx_mcp/geo.py` (this repo) | Street/ЖК/metro extractor, Google Maps + Nominatim geocoder, and Haversine radius filter |
 
 ## Resuming Context in a New Session
 
@@ -27,6 +29,7 @@ Drive single-item purchases and multi-component hardware builds on `olx.ua` with
 
 ### Step 1: Decompose & Benchmark (`create_buy_campaign` + `benchmark_market_price`)
 - Single item → create one campaign with `create_buy_campaign(query=..., city=..., target_buy_price=...)`.
+- Real estate / local radius search (e.g., apartment within 1 km of a metro station or in a specific district) → pass `near_address="метро Осокорки, Київ"`, `radius_km=1.0`, and/or `district="Дарницький"` to `search_offers` or `benchmark_market_price`. `geo.py` extracts street/ЖК names from the listing title/description, geocodes them via Google Maps API (or OpenStreetMap fallback), and computes exact `distance_km` and `walking_minutes_est`.
 - Multi-component build (e.g., dual-socket AI PC) → create one campaign per component slot (`Motherboard`, `2x CPU`, `ECC RAM`, `GPU`, `PSU`) **plus** one bundle campaign (`комплект X99 dual / 2x Xeon`) to compare bundle vs parts total.
 - Always run `benchmark_market_price` before evaluating any listing — strips cheap cases/boxes/broken-parts noise (`<22%` of rough median) and computes `p10`, `p25`, `median`, `p75`, and per-offer `leverage_score`.
 - **Never trust `stats` from a bare query.** The raw search mixes in whole PCs, accessories, other models and broken cards. A first RTX 3090 run with only `min_valid_price` gave a median of 95 250 UAH (real used 3090s: about 16 500–20 000), and the wrong conclusion "the market starts at 70 000" came from it. Always set:
@@ -73,6 +76,6 @@ Read-only. Prints `auth_status`, the benchmark stats and the candidates; `--all`
 
 | Symptom | Cause | Fix |
 | :--- | :--- | :--- |
-| `HTTP 401 {"error":"Unauthorized"}` on `api.chat.olx.ua` | OLX AWS Cognito `access_token` has a 15-minute TTL | `AuthVault.build_client()` automatically refreshes expired tokens in headless Chrome (`--headless=new`) using saved session cookies (`SID`, `IDPState`) in `~/.config/olx-mcp/auth.json`. If `SID` expired after weeks, call `browser_login`. |
+| `HTTP 401 {"error":"Unauthorized"}` or `HTTP 403` on expired session | OLX AWS Cognito `access_token` has a 15-minute TTL, and `SID`/`aws-waf-token` eventually expire | `AuthVault.build_client()` and `OlxClient` (`on_auth_expired`) first try silent headless refresh (`--headless=new`), and if that fails, automatically launch a visible Chrome login window (`interactive_browser_login(headless=False)`) so the user can re-login and the request retries automatically. Set `OLX_MCP_NO_INTERACTIVE_LOGIN=1` in background jobs. |
 | `HTTP 403 The request could not be satisfied` from CloudFront on `www.olx.ua` | CloudFront WAF blocks Python `urllib` / `curl` JA3 TLS fingerprints or US VPN exit IPs | `OlxClient.request_json` automatically falls back to a shared headless Chrome CDP session (`_get_or_start_shared_cdp`). If still 403, disconnect US VPN so traffic exits via UA/EU. |
 | `blocked_reason: already_contacted_offer` on `send_seller_message` | Anti-duplicate guard prevented sending a second cold outreach to the same `offer_id` | Pass `thread_id` (from `list_threads` or `deal.thread_id`) to reply inside the existing conversation, or `force=True` if explicitly requested by the user. |

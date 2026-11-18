@@ -31,9 +31,9 @@ def clean_html_text(raw: str | None, max_len: int = 800) -> str:
     return compact
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class OfferSummary:
-    """Normalized OLX offer card with price, negotiable flag, and seller signals."""
+    """Normalized OLX offer card with price, negotiable flag, GPS coordinates, and seller signals."""
 
     id: int
     title: str
@@ -46,6 +46,9 @@ class OfferSummary:
     city: str
     region: str
     district: str
+    lat: float | None
+    lon: float | None
+    map_radius: int | None
     created_time: str
     last_refresh_time: str
     age_days: int
@@ -118,6 +121,14 @@ def parse_offer(raw: dict[str, Any], *, max_desc_len: int = 500) -> OfferSummary
     region = str((loc.get("region") or {}).get("name") or "")
     district = str((loc.get("district") or {}).get("name") or "")
 
+    map_block = raw.get("map") if isinstance(raw.get("map"), dict) else {}
+    raw_lat = map_block.get("lat")
+    raw_lon = map_block.get("lon")
+    raw_rad = map_block.get("radius")
+    lat = round(float(raw_lat), 6) if isinstance(raw_lat, (int, float)) else None
+    lon = round(float(raw_lon), 6) if isinstance(raw_lon, (int, float)) else None
+    map_radius = int(raw_rad) if isinstance(raw_rad, (int, float)) else None
+
     created_time = str(raw.get("created_time") or "")
     last_refresh_time = str(raw.get("last_refresh_time") or "")
     age_days = _parse_iso_age_days(created_time)
@@ -156,6 +167,9 @@ def parse_offer(raw: dict[str, Any], *, max_desc_len: int = 500) -> OfferSummary
         city=city,
         region=region,
         district=district,
+        lat=lat,
+        lon=lon,
+        map_radius=map_radius,
         created_time=created_time,
         last_refresh_time=last_refresh_time,
         age_days=age_days,
